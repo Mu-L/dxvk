@@ -83,10 +83,17 @@ namespace dxvk {
     /// a higher value. May help with frame timing issues.
     int32_t maxFrameLatency;
 
+    /// Limit frame rate
+    int32_t maxFrameRate;
+
     /// Defer surface creation until first present call. This
     /// fixes issues with games that create multiple swap chains
     /// for a single window that may interfere with each other.
     bool deferSurfaceCreation;
+
+    /// Forces the sample count of all textures to be 1, and
+    /// performs the required shader and resolve fixups.
+    bool disableMsaa;
 
     /// Apitrace mode: Maps all buffers in cached memory.
     /// Enabled automatically if dxgitrace.dll is attached.

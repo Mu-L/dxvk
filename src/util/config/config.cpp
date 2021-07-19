@@ -68,10 +68,6 @@ namespace dxvk {
     { R"(\\FIFA(19|[2-9][0-9])(_demo)?\.exe$)", {{
       { "dxvk.useRawSsbo",                  "True" },
     }} },
-    /* Final Fantasy XIV: Fix random black blocks */
-    { R"(\\ffxiv_dx11\.exe$)", {{
-      { "d3d11.enableRtOutputNanFixup",     "True" },
-    }} },
     /* Resident Evil 2/3: Ignore WaW hazards      */
     { R"(\\re(2|3|3demo)\.exe$)", {{
       { "d3d11.relaxedBarriers",            "True" },
@@ -111,6 +107,11 @@ namespace dxvk {
     /* NieR:Automata                              */
     { R"(\\NieRAutomata\.exe$)", {{
       { "d3d11.constantBufferRangeCheck",   "True" },
+    }} },
+    /* NieR Replicant                             */
+    { R"(\\NieR Replicant ver\.1\.22474487139\.exe)", {{
+      { "dxgi.syncInterval",                "1"   },
+      { "dxgi.maxFrameRate",                "60"  },
     }} },
     /* SteamVR performance test                   */
     { R"(\\vr\.exe$)", {{
@@ -170,6 +171,10 @@ namespace dxvk {
     { R"(\\FAIRY_TAIL\.exe$)", {{
       { "d3d9.deferSurfaceCreation",        "True" },
     }} },
+    /* Nights of Azure                            */
+    { R"(\\CNN\.exe$)", {{
+      { "d3d9.deferSurfaceCreation",        "True" },
+    }} },
     /* Star Wars Battlefront II: amdags issues    */
     { R"(\\starwarsbattlefrontii\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
@@ -222,6 +227,21 @@ namespace dxvk {
      * detects an AMD GPU                         */
     { R"(\\DIRT5\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
+    }} },
+    /* Crazy Machines 3 - crashes on long device  *
+     * descriptions                               */
+    { R"(\\cm3\.exe$)", {{
+      { "dxgi.customDeviceDesc",            "DXVK Adapter" },
+    }} },
+    /* GTA IV: Thinks we're always on Intel       *
+     * and will report/use bad amounts of VRAM.   */
+    { R"(\\GTAIV\.exe$)", {{
+      { "dxgi.emulateUMA",                  "True" },
+    }} },
+    /* World of Final Fantasy: Broken and useless *
+     * use of 4x MSAA throughout the renderer     */
+    { R"(\\WOFF\.exe$)", {{
+      { "d3d11.disableMsaa",                "True" },
     }} },
 
     /**********************************************/
@@ -384,7 +404,7 @@ namespace dxvk {
     }} },
     /* TrackMania Forever                        */
     { R"(\\TmForever\.exe$)", {{
-      { "d3d9.swvpFloatCount",              "128" },
+      { "d3d9.swvpFloatCount",              "256" },
       { "d3d9.swvpIntCount",                "16" },
       { "d3d9.swvpBoolCount",               "16" },
     }} },
@@ -404,6 +424,27 @@ namespace dxvk {
     /* Dal Segno                                 */
     { R"(\\DST\.exe$)", {{
       { "d3d9.deferSurfaceCreation",        "True" },
+    }} },
+    /* Kohan II                                  */
+    { R"(\\k2\.exe$)", {{
+      { "d3d9.memoryTrackTest",             "True" },
+    }} },
+    /* Ninja Gaiden Sigma 1/2                    */
+    { R"(\\NINJA GAIDEN SIGMA(2)?\.exe$)", {{
+      { "d3d9.deferSurfaceCreation",        "True" },
+    }} },
+    /* Demon Stone breaks at frame rates > 60fps */
+    { R"(\\Demonstone\.exe$)", {{
+      { "d3d9.maxFrameRate",                "60" },
+    }} },
+    /* Far Cry 1 has worse water rendering when it detects AMD GPUs */
+    { R"(\\FarCry\.exe$)", {{
+      { "d3d9.customVendorId",              "10de" },
+    }} },
+    /* Earth Defense Force 5 */
+    { R"(\\EDF5\.exe$)", {{
+      { "dxgi.tearFree",                    "False" },
+      { "dxgi.syncInterval",                "1"     },
     }} },
   }};
 

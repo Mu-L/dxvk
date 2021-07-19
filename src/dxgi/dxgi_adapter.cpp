@@ -67,7 +67,7 @@ namespace dxvk {
   
   DxgiAdapter::~DxgiAdapter() {
     if (m_eventThread.joinable()) {
-      std::unique_lock<std::mutex> lock(m_mutex);
+      std::unique_lock<dxvk::mutex> lock(m_mutex);
       m_eventCookie = ~0u;
       m_cond.notify_one();
 
@@ -253,6 +253,11 @@ namespace dxvk {
     if (options->customDeviceId >= 0)
       deviceProp.deviceID = options->customDeviceId;
     
+    const char* description = deviceProp.deviceName;
+    // Custom device description
+    if (!options->customDeviceDesc.empty())
+      description = options->customDeviceDesc.c_str();
+    
     // XXX nvapi workaround for a lot of Unreal Engine 4 games
     if (options->customVendorId < 0 && options->customDeviceId < 0
      && options->nvapiHack && deviceProp.vendorID == uint16_t(DxvkGpuVendor::Nvidia)) {
@@ -263,7 +268,7 @@ namespace dxvk {
     
     // Convert device name
     std::memset(pDesc->Description, 0, sizeof(pDesc->Description));
-    str::tows(deviceProp.deviceName, pDesc->Description);
+    str::tows(description, pDesc->Description);
     
     // Get amount of video memory
     // based on the Vulkan heaps
@@ -277,6 +282,15 @@ namespace dxvk {
         deviceMemory += heap.size;
       else
         sharedMemory += heap.size;
+    }
+
+    // Some games think we are on Intel given a lack of
+    // NVAPI or AGS/atiadlxx support.
+    // Report our device memory as shared memory,
+    // and some small amount for the carveout.
+    if (options->emulateUMA && !m_adapter->isUnifiedMemoryArchitecture()) {
+      sharedMemory = deviceMemory;
+      deviceMemory = 128 * (1 << 20);
     }
     
     // Some games are silly and need their memory limited
@@ -392,7 +406,7 @@ namespace dxvk {
     if (!hEvent || !pdwCookie)
       return E_INVALIDARG;
 
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
     DWORD cookie = ++m_eventCookie;
 
     m_eventMap.insert({ cookie, hEvent });
@@ -417,7 +431,7 @@ namespace dxvk {
 
   void STDMETHODCALLTYPE DxgiAdapter::UnregisterVideoMemoryBudgetChangeNotification(
           DWORD                         dwCookie) {
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
     m_eventMap.erase(dwCookie);
   }
 
@@ -435,7 +449,7 @@ namespace dxvk {
   void DxgiAdapter::runEventThread() {
     env::setThreadName(str::format("dxvk-adapter-", m_index));
 
-    std::unique_lock<std::mutex> lock(m_mutex);
+    std::unique_lock<dxvk::mutex> lock(m_mutex);
     DxvkAdapterMemoryInfo memoryInfoOld = m_adapter->getMemoryHeapInfo();
 
     while (true) {

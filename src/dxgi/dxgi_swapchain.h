@@ -11,6 +11,8 @@
 
 #include "../spirv/spirv_module.h"
 
+#include "../util/util_time.h"
+
 namespace dxvk {
   
   class DxgiDevice;
@@ -173,8 +175,8 @@ namespace dxvk {
       RECT rect    = { 0, 0, 0, 0 };
     };
     
-    std::recursive_mutex            m_lockWindow;
-    std::mutex                      m_lockBuffer;
+    dxvk::recursive_mutex           m_lockWindow;
+    dxvk::mutex                     m_lockBuffer;
 
     Com<IDXGIFactory>               m_factory;
     Com<IDXGIAdapter>               m_adapter;
@@ -184,8 +186,8 @@ namespace dxvk {
     HWND                            m_window;
     DXGI_SWAP_CHAIN_DESC1           m_desc;
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC m_descFs;
-    DXGI_FRAME_STATISTICS           m_stats;
-    
+    UINT                            m_presentCount;
+
     Com<IDXGIVkSwapChain>           m_presenter;
     
     HMONITOR                        m_monitor;
@@ -216,6 +218,10 @@ namespace dxvk {
             DXGI_VK_MONITOR_DATA**  ppData);
     
     void ReleaseMonitorData();
+
+    void NotifyModeChange(
+            HMONITOR                hMonitor,
+            BOOL                    Windowed);
     
   };
   

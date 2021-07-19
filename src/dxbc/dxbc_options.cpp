@@ -41,23 +41,13 @@ namespace dxvk {
     enableRtOutputNanFixup   = options.enableRtOutputNanFixup;
     zeroInitWorkgroupMemory  = options.zeroInitWorkgroupMemory;
     forceTgsmBarriers        = options.forceTgsmBarriers;
+    disableMsaa              = options.disableMsaa;
     dynamicIndexedConstantBufferAsSsbo = options.constantBufferRangeCheck;
 
-    // Disable early discard on RADV (with LLVM) due to GPU hangs
-    // Disable early discard on Nvidia because it may hurt performance
-    bool isRadvAco = std::string(devInfo.core.properties.deviceName).find("RADV/ACO") != std::string::npos;
-
-    if ((adapter->matchesDriver(DxvkGpuVendor::Amd,    VK_DRIVER_ID_MESA_RADV_KHR,          0, 0) && !isRadvAco)
-     || (adapter->matchesDriver(DxvkGpuVendor::Nvidia, VK_DRIVER_ID_NVIDIA_PROPRIETARY_KHR, 0, 0)))
+    // Disable subgroup early discard on Nvidia because it may hurt performance
+    if (adapter->matchesDriver(DxvkGpuVendor::Nvidia, VK_DRIVER_ID_NVIDIA_PROPRIETARY_KHR, 0, 0))
       useSubgroupOpsForEarlyDiscard = false;
     
-    // Disable atomic counters on older RADV versions
-    if (adapter->matchesDriver(DxvkGpuVendor::Amd, VK_DRIVER_ID_MESA_RADV_KHR, 0, VK_MAKE_VERSION(19, 1, 0)))
-      useSubgroupOpsForAtomicCounters = false;
-    
-    // Apply shader-related options
-    applyTristate(useSubgroupOpsForEarlyDiscard, device->config().useEarlyDiscard);
-
     // Figure out float control flags to match D3D11 rules
     if (options.floatControls) {
       if (devInfo.khrShaderFloatControls.shaderSignedZeroInfNanPreserveFloat32)

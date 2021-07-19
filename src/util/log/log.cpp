@@ -50,7 +50,7 @@ namespace dxvk {
   
   void Logger::emitMsg(LogLevel level, const std::string& message) {
     if (level >= m_minLevel) {
-      std::lock_guard<std::mutex> lock(m_mutex);
+      std::lock_guard<dxvk::mutex> lock(m_mutex);
       
       static std::array<const char*, 5> s_prefixes
         = {{ "trace: ", "debug: ", "info:  ", "warn:  ", "err:   " }};
@@ -100,12 +100,7 @@ namespace dxvk {
     if (!path.empty() && *path.rbegin() != '/')
       path += '/';
 
-    std::string exeName = env::getExeName();
-    auto extp = exeName.find_last_of('.');
-    
-    if (extp != std::string::npos && exeName.substr(extp + 1) == "exe")
-      exeName.erase(extp);
-    
+    std::string exeName = env::getExeBaseName();
     path += exeName + "_" + base;
     return path;
   }

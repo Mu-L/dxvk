@@ -73,9 +73,116 @@ namespace dxvk::util {
   }
   
   
+  void packImageData(
+          void*             dstBytes,
+    const void*             srcBytes,
+          VkDeviceSize      srcRowPitch,
+          VkDeviceSize      srcSlicePitch,
+          VkDeviceSize      dstRowPitchIn,
+          VkDeviceSize      dstSlicePitchIn,
+          VkImageType       imageType,
+          VkExtent3D        imageExtent,
+          uint32_t          imageLayers,
+    const DxvkFormatInfo*   formatInfo,
+          VkImageAspectFlags aspectMask) {
+    for (uint32_t i = 0; i < imageLayers; i++) {
+      auto dstData = reinterpret_cast<      char*>(dstBytes);
+      auto srcData = reinterpret_cast<const char*>(srcBytes);
+
+      for (auto aspects = aspectMask; aspects; ) {
+        auto aspect = vk::getNextAspect(aspects);
+        auto extent = imageExtent;
+        auto elementSize = formatInfo->elementSize;
+
+        if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+          auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+          extent.width  /= plane->blockSize.width;
+          extent.height /= plane->blockSize.height;
+          elementSize = plane->elementSize;
+        }
+
+        auto blockCount = computeBlockCount(extent, formatInfo->blockSize);
+
+        VkDeviceSize bytesPerRow   = blockCount.width  * elementSize;
+        VkDeviceSize bytesPerSlice = blockCount.height * bytesPerRow;
+        VkDeviceSize bytesTotal    = blockCount.depth  * bytesPerSlice;
+
+        VkDeviceSize dstRowPitch   = dstRowPitchIn   ? dstRowPitchIn   : bytesPerRow;
+        VkDeviceSize dstSlicePitch = dstSlicePitchIn ? dstSlicePitchIn : bytesPerSlice;
+
+        const bool directCopy = ((bytesPerRow   == srcRowPitch   && bytesPerRow   == dstRowPitch  ) || (blockCount.height == 1))
+                             && ((bytesPerSlice == srcSlicePitch && bytesPerSlice == dstSlicePitch) || (blockCount.depth  == 1));
+
+        if (directCopy) {
+          std::memcpy(dstData, srcData, bytesTotal);
+
+          switch (imageType) {
+            case VK_IMAGE_TYPE_1D:
+              srcData += srcRowPitch;
+              dstData += dstRowPitch;
+              break;
+            case VK_IMAGE_TYPE_2D:
+              srcData += blockCount.height * srcRowPitch;
+              dstData += blockCount.height * dstRowPitch;
+              break;
+            case VK_IMAGE_TYPE_3D:
+              srcData += blockCount.depth * srcSlicePitch;
+              dstData += blockCount.depth * dstSlicePitch;
+              break;
+            default: ;
+          }
+        } else {
+          for (uint32_t i = 0; i < blockCount.depth; i++) {
+            for (uint32_t j = 0; j < blockCount.height; j++) {
+              std::memcpy(
+                dstData + j * dstRowPitch,
+                srcData + j * srcRowPitch,
+                bytesPerRow);
+            }
+
+            switch (imageType) {
+              case VK_IMAGE_TYPE_1D:
+                srcData += srcRowPitch;
+                dstData += dstRowPitch;
+                break;
+              case VK_IMAGE_TYPE_2D:
+                srcData += blockCount.height * srcRowPitch;
+                dstData += blockCount.height * dstRowPitch;
+                break;
+              case VK_IMAGE_TYPE_3D:
+                srcData += srcSlicePitch;
+                dstData += dstSlicePitch;
+                break;
+              default: ;
+            }
+          }
+        }
+      }
+    }
+  }
+
+
   VkDeviceSize computeImageDataSize(VkFormat format, VkExtent3D extent) {
     const DxvkFormatInfo* formatInfo = imageFormatInfo(format);
-    return formatInfo->elementSize * flattenImageExtent(computeBlockCount(extent, formatInfo->blockSize));
+
+    VkDeviceSize size = 0;
+
+    for (auto aspects = formatInfo->aspectMask; aspects; ) {
+      auto aspect = vk::getNextAspect(aspects);
+      auto elementSize = formatInfo->elementSize;
+      auto planeExtent = extent;
+
+      if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+        auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+        planeExtent.width  /= plane->blockSize.width;
+        planeExtent.height /= plane->blockSize.height;
+        elementSize = plane->elementSize;
+      }
+
+      size += elementSize * flattenImageExtent(computeBlockCount(planeExtent, formatInfo->blockSize));
+    }
+
+    return size;
   }
 
 

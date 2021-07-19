@@ -66,10 +66,7 @@ namespace dxvk {
   
   Rc<DxvkCommandList> DxvkContext::endRecording() {
     this->spillRenderPass(true);
-
-    // Ensure that any shared images are in their
-    // default layout for the next submission
-    this->transitionRenderTargetLayouts(m_execBarriers, true);
+    this->flushSharedImages();
 
     m_sdmaBarriers.recordCommands(m_cmd);
     m_initBarriers.recordCommands(m_cmd);
@@ -503,15 +500,6 @@ namespace dxvk {
     const VkImageSubresourceRange&  subresources) {
     this->spillRenderPass(false);
 
-    // Allocate enough staging buffer memory to fit one
-    // single subresource, then dispatch multiple copies
-    VkDeviceSize dataSize = util::computeImageDataSize(
-      image->info().format,
-      image->mipLevelExtent(subresources.baseMipLevel));
-    
-    auto zeroBuffer = createZeroBuffer(dataSize);
-    auto zeroHandle = zeroBuffer->getSliceHandle();
-
     VkImageLayout layout = image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
 
     this->initializeImage(image, subresources, layout,
@@ -520,23 +508,55 @@ namespace dxvk {
 
     m_execAcquires.recordCommands(m_cmd);
 
-    for (uint32_t level = 0; level < subresources.levelCount; level++) {
-      VkOffset3D offset = VkOffset3D { 0, 0, 0 };
-      VkExtent3D extent = image->mipLevelExtent(subresources.baseMipLevel + level);
+    auto formatInfo = image->formatInfo();
 
-      for (uint32_t layer = 0; layer < subresources.layerCount; layer++) {
-        VkBufferImageCopy region;
-        region.bufferOffset       = zeroHandle.offset;
-        region.bufferRowLength    = 0;
-        region.bufferImageHeight  = 0;
-        region.imageSubresource   = vk::makeSubresourceLayers(
-          vk::pickSubresource(subresources, level, layer));
-        region.imageOffset        = offset;
-        region.imageExtent        = extent;
+    for (auto aspects = formatInfo->aspectMask; aspects; ) {
+      auto aspect = vk::getNextAspect(aspects);
+      auto extent = image->mipLevelExtent(subresources.baseMipLevel);
+      auto elementSize = formatInfo->elementSize;
 
-        m_cmd->cmdCopyBufferToImage(DxvkCmdBuffer::ExecBuffer,
-          zeroHandle.handle, image->handle(), layout, 1, &region);
+      if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+        auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+        extent.width  /= plane->blockSize.width;
+        extent.height /= plane->blockSize.height;
+        elementSize = plane->elementSize;
       }
+
+      // Allocate enough staging buffer memory to fit one
+      // single subresource, then dispatch multiple copies
+      VkExtent3D blockCount = util::computeBlockCount(extent, formatInfo->blockSize);
+      VkDeviceSize dataSize = util::flattenImageExtent(blockCount) * elementSize;
+      
+      auto zeroBuffer = createZeroBuffer(dataSize);
+      auto zeroHandle = zeroBuffer->getSliceHandle();
+
+      for (uint32_t level = 0; level < subresources.levelCount; level++) {
+        VkOffset3D offset = VkOffset3D { 0, 0, 0 };
+        VkExtent3D extent = image->mipLevelExtent(subresources.baseMipLevel + level);
+
+        if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+          auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+          extent.width  /= plane->blockSize.width;
+          extent.height /= plane->blockSize.height;
+        }
+
+        for (uint32_t layer = 0; layer < subresources.layerCount; layer++) {
+          VkBufferImageCopy region;
+          region.bufferOffset       = zeroHandle.offset;
+          region.bufferRowLength    = 0;
+          region.bufferImageHeight  = 0;
+          region.imageSubresource   = vk::makeSubresourceLayers(
+            vk::pickSubresource(subresources, level, layer));
+          region.imageSubresource.aspectMask = aspect;
+          region.imageOffset        = offset;
+          region.imageExtent        = extent;
+
+          m_cmd->cmdCopyBufferToImage(DxvkCmdBuffer::ExecBuffer,
+            zeroHandle.handle, image->handle(), layout, 1, &region);
+        }
+      }
+
+      m_cmd->trackResource<DxvkAccess::Read>(zeroBuffer);
     }
 
     m_execBarriers.accessImage(
@@ -548,7 +568,6 @@ namespace dxvk {
       image->info().access);
     
     m_cmd->trackResource<DxvkAccess::Write>(image);
-    m_cmd->trackResource<DxvkAccess::Read>(zeroBuffer);
   }
   
   
@@ -707,14 +726,15 @@ namespace dxvk {
           VkExtent3D            dstExtent,
     const Rc<DxvkBuffer>&       srcBuffer,
           VkDeviceSize          srcOffset,
-          VkExtent2D            srcExtent) {
+          VkDeviceSize          rowAlignment,
+          VkDeviceSize          sliceAlignment) {
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, dstImage, vk::makeSubresourceRange(dstSubresource));
 
     auto srcSlice = srcBuffer->getSliceHandle(srcOffset, 0);
 
-    // We may copy to only one aspect of a depth-stencil image,
-    // but pipeline barriers need to have all aspect bits set
+    // We may copy to only one aspect at a time, but pipeline
+    // barriers need to have all available aspect bits set
     auto dstFormatInfo = dstImage->formatInfo();
 
     auto dstSubresourceRange = vk::makeSubresourceRange(dstSubresource);
@@ -742,19 +762,10 @@ namespace dxvk {
     }
       
     m_execAcquires.recordCommands(m_cmd);
-    
-    VkBufferImageCopy copyRegion;
-    copyRegion.bufferOffset       = srcSlice.offset;
-    copyRegion.bufferRowLength    = srcExtent.width;
-    copyRegion.bufferImageHeight  = srcExtent.height;
-    copyRegion.imageSubresource   = dstSubresource;
-    copyRegion.imageOffset        = dstOffset;
-    copyRegion.imageExtent        = dstExtent;
-    
-    m_cmd->cmdCopyBufferToImage(DxvkCmdBuffer::ExecBuffer,
-      srcSlice.handle, dstImage->handle(),
-      dstImageLayoutTransfer, 1, &copyRegion);
-    
+
+    this->copyImageBufferData<true>(DxvkCmdBuffer::ExecBuffer, dstImage, dstSubresource,
+      dstOffset, dstExtent, dstImageLayoutTransfer, srcSlice, rowAlignment, sliceAlignment);
+
     m_execBarriers.accessImage(
       dstImage, dstSubresourceRange,
       dstImageLayoutTransfer,
@@ -882,7 +893,8 @@ namespace dxvk {
   void DxvkContext::copyImageToBuffer(
     const Rc<DxvkBuffer>&       dstBuffer,
           VkDeviceSize          dstOffset,
-          VkExtent2D            dstExtent,
+          VkDeviceSize          rowAlignment,
+          VkDeviceSize          sliceAlignment,
     const Rc<DxvkImage>&        srcImage,
           VkImageSubresourceLayers srcSubresource,
           VkOffset3D            srcOffset,
@@ -916,17 +928,8 @@ namespace dxvk {
 
     m_execAcquires.recordCommands(m_cmd);
     
-    VkBufferImageCopy copyRegion;
-    copyRegion.bufferOffset       = dstSlice.offset;
-    copyRegion.bufferRowLength    = dstExtent.width;
-    copyRegion.bufferImageHeight  = dstExtent.height;
-    copyRegion.imageSubresource   = srcSubresource;
-    copyRegion.imageOffset        = srcOffset;
-    copyRegion.imageExtent        = srcExtent;
-    
-    m_cmd->cmdCopyImageToBuffer(DxvkCmdBuffer::ExecBuffer,
-      srcImage->handle(), srcImageLayoutTransfer,
-      dstSlice.handle, 1, &copyRegion);
+    this->copyImageBufferData<false>(DxvkCmdBuffer::ExecBuffer, srcImage, srcSubresource,
+      srcOffset, srcExtent, srcImageLayoutTransfer, dstSlice, rowAlignment, sliceAlignment);
     
     m_execBarriers.accessImage(
       srcImage, srcSubresourceRange,
@@ -950,7 +953,9 @@ namespace dxvk {
 
   void DxvkContext::copyDepthStencilImageToPackedBuffer(
     const Rc<DxvkBuffer>&       dstBuffer,
-          VkDeviceSize          dstOffset,
+          VkDeviceSize          dstBufferOffset,
+          VkOffset2D            dstOffset,
+          VkExtent2D            dstExtent,
     const Rc<DxvkImage>&        srcImage,
           VkImageSubresourceLayers srcSubresource,
           VkOffset2D            srcOffset,
@@ -988,7 +993,7 @@ namespace dxvk {
     VkImageLayout layout = srcImage->pickLayout(VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
 
     DxvkMetaPackDescriptors descriptors;
-    descriptors.dstBuffer  = dstBuffer->getDescriptor(dstOffset, VK_WHOLE_SIZE).buffer;
+    descriptors.dstBuffer  = dstBuffer->getDescriptor(dstBufferOffset, VK_WHOLE_SIZE).buffer;
     descriptors.srcDepth   = dView->getDescriptor(VK_IMAGE_VIEW_TYPE_2D_ARRAY, layout).image;
     descriptors.srcStencil = sView->getDescriptor(VK_IMAGE_VIEW_TYPE_2D_ARRAY, layout).image;
 
@@ -1018,6 +1023,8 @@ namespace dxvk {
     DxvkMetaPackArgs args;
     args.srcOffset = srcOffset;
     args.srcExtent = srcExtent;
+    args.dstOffset = dstOffset;
+    args.dstExtent = dstExtent;
 
     m_cmd->cmdBindPipeline(
       VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1061,13 +1068,180 @@ namespace dxvk {
   }
   
   
+  void DxvkContext::copyPackedBufferImage(
+    const Rc<DxvkBuffer>&       dstBuffer,
+          VkDeviceSize          dstBufferOffset,
+          VkOffset3D            dstOffset,
+          VkExtent3D            dstSize,
+    const Rc<DxvkBuffer>&       srcBuffer,
+          VkDeviceSize          srcBufferOffset,
+          VkOffset3D            srcOffset,
+          VkExtent3D            srcSize,
+          VkExtent3D            extent,
+          VkDeviceSize          elementSize) {
+    this->spillRenderPass(true);
+    this->unbindComputePipeline();
+
+    auto dstBufferSlice = dstBuffer->getSliceHandle(dstBufferOffset, elementSize * util::flattenImageExtent(dstSize));
+    auto srcBufferSlice = srcBuffer->getSliceHandle(srcBufferOffset, elementSize * util::flattenImageExtent(srcSize));
+
+    if (m_execBarriers.isBufferDirty(dstBufferSlice, DxvkAccess::Write)
+     || m_execBarriers.isBufferDirty(srcBufferSlice, DxvkAccess::Read))
+      m_execBarriers.recordCommands(m_cmd);
+
+    // We'll use texel buffer views with an appropriately
+    // sized integer format to perform the copy
+    VkFormat format = VK_FORMAT_UNDEFINED;
+
+    switch (elementSize) {
+      case  1: format = VK_FORMAT_R8_UINT; break;
+      case  2: format = VK_FORMAT_R16_UINT; break;
+      case  4: format = VK_FORMAT_R32_UINT; break;
+      case  8: format = VK_FORMAT_R32G32_UINT; break;
+      case 12: format = VK_FORMAT_R32G32B32_UINT; break;
+      case 16: format = VK_FORMAT_R32G32B32A32_UINT; break;
+    }
+
+    if (!format) {
+      Logger::err(str::format("DxvkContext: copyPackedBufferImage: Unsupported element size ", elementSize));
+      return;
+    }
+
+    DxvkBufferViewCreateInfo viewInfo;
+    viewInfo.format = format;
+    viewInfo.rangeOffset = dstBufferOffset;
+    viewInfo.rangeLength = dstBufferSlice.length;
+    Rc<DxvkBufferView> dstView = m_device->createBufferView(dstBuffer, viewInfo);
+
+    viewInfo.rangeOffset = srcBufferOffset;
+    viewInfo.rangeLength = srcBufferSlice.length;
+    Rc<DxvkBufferView> srcView;
+
+    if (srcBuffer == dstBuffer
+     && srcBufferSlice.offset < dstBufferSlice.offset + dstBufferSlice.length
+     && srcBufferSlice.offset + srcBufferSlice.length > dstBufferSlice.offset) {
+      // Create temporary copy in case of overlapping regions
+      DxvkBufferCreateInfo bufferInfo;
+      bufferInfo.size   = srcBufferSlice.length;
+      bufferInfo.usage  = VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                        | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
+      bufferInfo.stages = VK_PIPELINE_STAGE_TRANSFER_BIT
+                        | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+      bufferInfo.access = VK_ACCESS_TRANSFER_WRITE_BIT
+                        | VK_ACCESS_SHADER_READ_BIT;
+      Rc<DxvkBuffer> tmpBuffer = m_device->createBuffer(bufferInfo, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+      auto tmpBufferSlice = tmpBuffer->getSliceHandle();
+
+      VkBufferCopy copyRegion;
+      copyRegion.srcOffset = srcBufferSlice.offset;
+      copyRegion.dstOffset = tmpBufferSlice.offset;
+      copyRegion.size = tmpBufferSlice.length;
+
+      m_cmd->cmdCopyBuffer(DxvkCmdBuffer::ExecBuffer,
+        srcBufferSlice.handle, tmpBufferSlice.handle,
+        1, &copyRegion);
+
+      emitMemoryBarrier(0,
+        VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_ACCESS_SHADER_READ_BIT);
+
+      viewInfo.rangeOffset = 0;
+      srcView = m_device->createBufferView(tmpBuffer, viewInfo);
+
+      m_cmd->trackResource<DxvkAccess::Write>(tmpBuffer);
+    } else {
+      srcView = m_device->createBufferView(srcBuffer, viewInfo);
+    }
+
+    auto pipeInfo = m_common->metaCopy().getCopyBufferImagePipeline();
+    VkDescriptorSet descriptorSet = allocateDescriptorSet(pipeInfo.dsetLayout);
+
+    std::array<VkWriteDescriptorSet, 2> descriptorWrites;
+
+    std::array<std::pair<VkDescriptorType, VkBufferView>, 2> descriptorInfos = {{
+      { VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, dstView->handle() },
+      { VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, srcView->handle() },
+    }};
+
+    for (uint32_t i = 0; i < descriptorWrites.size(); i++) {
+      auto write = &descriptorWrites[i];
+      auto info = &descriptorInfos[i];
+
+      write->sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+      write->pNext = nullptr;
+      write->dstSet = descriptorSet;
+      write->dstBinding = i;
+      write->dstArrayElement = 0;
+      write->descriptorCount = 1;
+      write->descriptorType = info->first;
+      write->pImageInfo = nullptr;
+      write->pBufferInfo = nullptr;
+      write->pTexelBufferView = &info->second;
+    }
+
+    m_cmd->updateDescriptorSets(descriptorWrites.size(), descriptorWrites.data());
+
+    DxvkCopyBufferImageArgs args = { };
+    args.dstOffset = dstOffset;
+    args.srcOffset = srcOffset;
+    args.extent = extent;
+    args.dstSize = { dstSize.width, dstSize.height };
+    args.srcSize = { srcSize.width, srcSize.height };
+
+    m_cmd->cmdBindPipeline(
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeInfo.pipeHandle);
+    
+    m_cmd->cmdBindDescriptorSet(
+      VK_PIPELINE_BIND_POINT_COMPUTE,
+      pipeInfo.pipeLayout, descriptorSet,
+      0, nullptr);
+    
+    m_cmd->cmdPushConstants(
+      pipeInfo.pipeLayout,
+      VK_SHADER_STAGE_COMPUTE_BIT,
+      0, sizeof(args), &args);
+    
+    m_cmd->cmdDispatch(
+      (extent.width  + 7) / 8,
+      (extent.height + 7) / 8,
+      extent.depth);
+    
+    m_execBarriers.accessBuffer(
+      dstView->getSliceHandle(),
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_WRITE_BIT,
+      dstBuffer->info().stages,
+      dstBuffer->info().access);
+
+    m_execBarriers.accessBuffer(
+      srcView->getSliceHandle(),
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+      VK_ACCESS_SHADER_READ_BIT,
+      srcBuffer->info().stages,
+      srcBuffer->info().access);
+
+    // Track all involved resources
+    m_cmd->trackResource<DxvkAccess::Write>(dstBuffer);
+    m_cmd->trackResource<DxvkAccess::Read>(srcBuffer);
+
+    m_cmd->trackResource<DxvkAccess::None>(dstView);
+    m_cmd->trackResource<DxvkAccess::None>(srcView);
+  }
+
+
   void DxvkContext::copyPackedBufferToDepthStencilImage(
     const Rc<DxvkImage>&        dstImage,
           VkImageSubresourceLayers dstSubresource,
           VkOffset2D            dstOffset,
           VkExtent2D            dstExtent,
     const Rc<DxvkBuffer>&       srcBuffer,
-          VkDeviceSize          srcOffset,
+          VkDeviceSize          srcBufferOffset,
+          VkOffset2D            srcOffset,
+          VkExtent2D            srcExtent,
           VkFormat              format) {
     this->spillRenderPass(true);
     this->prepareImage(m_execBarriers, dstImage, vk::makeSubresourceRange(dstSubresource));
@@ -1139,15 +1313,17 @@ namespace dxvk {
     DxvkMetaUnpackDescriptors descriptors;
     descriptors.dstDepth   = tmpBufferViewD->handle();
     descriptors.dstStencil = tmpBufferViewS->handle();
-    descriptors.srcBuffer  = srcBuffer->getDescriptor(srcOffset, VK_WHOLE_SIZE).buffer;
+    descriptors.srcBuffer  = srcBuffer->getDescriptor(srcBufferOffset, VK_WHOLE_SIZE).buffer;
 
     VkDescriptorSet dset = allocateDescriptorSet(pipeInfo.dsetLayout);
     m_cmd->updateDescriptorSetWithTemplate(dset, pipeInfo.dsetTemplate, &descriptors);
 
     // Unpack the source buffer to temporary buffers
-    DxvkMetaUnpackArgs args;
+    DxvkMetaPackArgs args;
+    args.srcOffset = srcOffset;
+    args.srcExtent = srcExtent;
+    args.dstOffset = VkOffset2D { 0, 0 };
     args.dstExtent = dstExtent;
-    args.srcExtent = dstExtent;
 
     m_cmd->cmdBindPipeline(
       VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1241,6 +1417,9 @@ namespace dxvk {
 
   void DxvkContext::discardBuffer(
     const Rc<DxvkBuffer>&       buffer) {
+    if (buffer->memFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+      return;
+
     if (m_execBarriers.isBufferDirty(buffer->getSliceHandle(), DxvkAccess::Write))
       this->invalidateBuffer(buffer, buffer->allocSlice());
   }
@@ -1816,7 +1995,7 @@ namespace dxvk {
       VkPipelineStageFlags clearStages = 0;
       VkAccessFlags        clearAccess = 0;
       
-      if (clearAspects & VK_IMAGE_ASPECT_COLOR_BIT) {
+      if ((clearAspects | discardAspects) & VK_IMAGE_ASPECT_COLOR_BIT) {
         clearStages |= VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
         clearAccess |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
@@ -1880,7 +2059,7 @@ namespace dxvk {
           VkImageAspectFlags        clearAspects,
           VkClearValue              clearValue) {
     for (auto& entry : m_deferredClears) {
-      if (entry.imageView->checkSubresourceMatch(imageView)) {
+      if (entry.imageView->matchesView(imageView)) {
         entry.imageView = imageView;
         entry.discardAspects &= ~clearAspects;
         entry.clearAspects |= clearAspects;
@@ -1907,7 +2086,7 @@ namespace dxvk {
     const Rc<DxvkImageView>&        imageView,
           VkImageAspectFlags        discardAspects) {
     for (auto& entry : m_deferredClears) {
-      if (entry.imageView->checkSubresourceMatch(imageView)) {
+      if (entry.imageView->matchesView(imageView)) {
         entry.imageView = imageView;
         entry.discardAspects |= discardAspects;
         entry.clearAspects &= ~discardAspects;
@@ -1938,13 +2117,30 @@ namespace dxvk {
   }
 
 
+  void DxvkContext::flushSharedImages() {
+    for (auto i = m_deferredClears.begin(); i != m_deferredClears.end(); ) {
+      if (i->imageView->imageInfo().shared) {
+        this->performClear(i->imageView, -1, i->discardAspects, i->clearAspects, i->clearValue);
+        i = m_deferredClears.erase(i);
+      } else {
+        i++;
+      }
+    }
+
+    this->transitionRenderTargetLayouts(m_execBarriers, true);
+  }
+
+
   void DxvkContext::updateBuffer(
     const Rc<DxvkBuffer>&           buffer,
           VkDeviceSize              offset,
           VkDeviceSize              size,
     const void*                     data) {
+    bool isHostVisible = buffer->memFlags() & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+
     bool replaceBuffer = (size == buffer->info().size)
-                      && (size <= (1 << 20)); /* 1 MB */
+                      && (size <= (1 << 20))
+                      && !isHostVisible;
     
     DxvkBufferSliceHandle bufferSlice;
     DxvkCmdBuffer         cmdBuffer;
@@ -2026,31 +2222,10 @@ namespace dxvk {
           VkDeviceSize              pitchPerLayer) {
     this->spillRenderPass(true);
 
-    // Upload data through a staging buffer. Special care needs to
-    // be taken when dealing with compressed image formats: Rather
-    // than copying pixels, we'll be copying blocks of pixels.
-    const DxvkFormatInfo* formatInfo = image->formatInfo();
-    
-    // Align image extent to a full block. This is necessary in
-    // case the image size is not a multiple of the block size.
-    VkExtent3D elementCount = util::computeBlockCount(
-      imageExtent, formatInfo->blockSize);
-    elementCount.depth *= subresources.layerCount;
-    
-    // Allocate staging buffer memory for the image data. The
-    // pixels or blocks will be tightly packed within the buffer.
-    auto stagingSlice = m_staging.alloc(CACHE_LINE_SIZE,
-      formatInfo->elementSize * util::flattenImageExtent(elementCount));
-    auto stagingHandle = stagingSlice.getSliceHandle();
-    
-    util::packImageData(stagingHandle.mapPtr, data,
-      elementCount, formatInfo->elementSize,
-      pitchPerRow, pitchPerLayer);
-    
     // Prepare the image layout. If the given extent covers
     // the entire image, we may discard its previous contents.
     auto subresourceRange = vk::makeSubresourceRange(subresources);
-    subresourceRange.aspectMask = formatInfo->aspectMask;
+    subresourceRange.aspectMask = image->formatInfo()->aspectMask;
 
     this->prepareImage(m_execBarriers, image, subresourceRange);
 
@@ -2076,20 +2251,9 @@ namespace dxvk {
 
     m_execAcquires.recordCommands(m_cmd);
     
-    // Copy contents of the staging buffer into the image.
-    // Since our source data is tightly packed, we do not
-    // need to specify any strides.
-    VkBufferImageCopy region;
-    region.bufferOffset       = stagingHandle.offset;
-    region.bufferRowLength    = 0;
-    region.bufferImageHeight  = 0;
-    region.imageSubresource   = subresources;
-    region.imageOffset        = imageOffset;
-    region.imageExtent        = imageExtent;
-    
-    m_cmd->cmdCopyBufferToImage(DxvkCmdBuffer::ExecBuffer,
-      stagingHandle.handle, image->handle(),
-      imageLayoutTransfer, 1, &region);
+    this->copyImageHostData(DxvkCmdBuffer::ExecBuffer,
+      image, subresources, imageOffset, imageExtent,
+      data, pitchPerRow, pitchPerLayer);
     
     // Transition image back into its optimal layout
     m_execBarriers.accessImage(
@@ -2102,7 +2266,6 @@ namespace dxvk {
       image->info().access);
     
     m_cmd->trackResource<DxvkAccess::Write>(image);
-    m_cmd->trackResource<DxvkAccess::Read>(stagingSlice.buffer());
   }
   
   
@@ -2140,7 +2303,8 @@ namespace dxvk {
     
     copyPackedBufferToDepthStencilImage(
       image, subresources, imageOffset, imageExtent,
-      tmpBuffer, 0, format);
+      tmpBuffer, 0, VkOffset2D { 0, 0 }, imageExtent,
+      format);
   }
 
 
@@ -2181,23 +2345,8 @@ namespace dxvk {
     const void*                     data,
           VkDeviceSize              pitchPerRow,
           VkDeviceSize              pitchPerLayer) {
-    const DxvkFormatInfo* formatInfo = image->formatInfo();
-
     VkOffset3D imageOffset = { 0, 0, 0 };
     VkExtent3D imageExtent = image->mipLevelExtent(subresources.mipLevel);
-    
-    // Allocate staging buffer slice and copy data to it
-    VkExtent3D elementCount = util::computeBlockCount(
-      imageExtent, formatInfo->blockSize);
-    elementCount.depth *= subresources.layerCount;
-    
-    auto stagingSlice = m_staging.alloc(CACHE_LINE_SIZE,
-      formatInfo->elementSize * util::flattenImageExtent(elementCount));
-    auto stagingHandle = stagingSlice.getSliceHandle();
-    
-    util::packImageData(stagingHandle.mapPtr, data,
-      elementCount, formatInfo->elementSize,
-      pitchPerRow, pitchPerLayer);
 
     DxvkCmdBuffer cmdBuffer = DxvkCmdBuffer::SdmaBuffer;
     DxvkBarrierSet* barriers = &m_sdmaAcquires;
@@ -2216,21 +2365,11 @@ namespace dxvk {
       VK_ACCESS_TRANSFER_WRITE_BIT);
 
     barriers->recordCommands(m_cmd);
-    
-    // Perform copy on the transfer queue
-    VkBufferImageCopy region;
-    region.bufferOffset       = stagingHandle.offset;
-    region.bufferRowLength    = 0;
-    region.bufferImageHeight  = 0;
-    region.imageSubresource   = subresources;
-    region.imageOffset        = imageOffset;
-    region.imageExtent        = imageExtent;
-    
-    m_cmd->cmdCopyBufferToImage(cmdBuffer,
-      stagingHandle.handle, image->handle(),
-      image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-      1, &region);
-    
+
+    this->copyImageHostData(cmdBuffer,
+      image, subresources, imageOffset, imageExtent,
+      data, pitchPerRow, pitchPerLayer);
+
     // Transfer ownership to graphics queue
     if (cmdBuffer == DxvkCmdBuffer::SdmaBuffer) {
       m_sdmaBarriers.releaseImage(m_initBarriers,
@@ -2255,7 +2394,6 @@ namespace dxvk {
     }
     
     m_cmd->trackResource<DxvkAccess::Write>(image);
-    m_cmd->trackResource<DxvkAccess::Read>(stagingSlice.buffer());
   }
 
 
@@ -2743,6 +2881,142 @@ namespace dxvk {
   }
 
 
+  template<bool ToImage>
+  void DxvkContext::copyImageBufferData(
+          DxvkCmdBuffer         cmd,
+    const Rc<DxvkImage>&        image,
+    const VkImageSubresourceLayers& imageSubresource,
+          VkOffset3D            imageOffset,
+          VkExtent3D            imageExtent,
+          VkImageLayout         imageLayout,
+    const DxvkBufferSliceHandle& bufferSlice,
+          VkDeviceSize          bufferRowAlignment,
+          VkDeviceSize          bufferSliceAlignment) {
+    auto formatInfo = image->formatInfo();
+    auto layers = imageSubresource.layerCount;
+
+    VkDeviceSize bufferOffset = bufferSlice.offset;
+
+    // Do one copy region per layer in case the buffer memory layout is weird
+    if (bufferSliceAlignment || formatInfo->flags.test(DxvkFormatFlag::MultiPlane))
+      layers = 1;
+
+    for (uint32_t i = 0; i < imageSubresource.layerCount; i += layers) {
+      auto aspectOffset = bufferOffset;
+
+      for (auto aspects = imageSubresource.aspectMask; aspects; ) {
+        auto aspect = vk::getNextAspect(aspects);
+        auto elementSize = formatInfo->elementSize;
+
+        VkBufferImageCopy copyRegion = { };
+        copyRegion.imageSubresource.aspectMask = aspect;
+        copyRegion.imageSubresource.baseArrayLayer = imageSubresource.baseArrayLayer + i;
+        copyRegion.imageSubresource.layerCount = layers;
+        copyRegion.imageSubresource.mipLevel = imageSubresource.mipLevel;
+        copyRegion.imageOffset = imageOffset;
+        copyRegion.imageExtent = imageExtent;
+
+        if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+          auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+          copyRegion.imageOffset.x /= plane->blockSize.width;
+          copyRegion.imageOffset.y /= plane->blockSize.height;
+          copyRegion.imageExtent.width  /= plane->blockSize.width;
+          copyRegion.imageExtent.height /= plane->blockSize.height;
+          elementSize = plane->elementSize;
+        }
+
+        // Vulkan can't really express row pitch in the same way that client APIs
+        // may expect, so we'll need to do some heroics here and hope that it works
+        VkExtent3D blockCount = util::computeBlockCount(copyRegion.imageExtent, formatInfo->blockSize);
+        VkDeviceSize rowPitch = blockCount.width * elementSize;
+
+        if (bufferRowAlignment > elementSize)
+          rowPitch = bufferRowAlignment >= rowPitch ? bufferRowAlignment : align(rowPitch, bufferRowAlignment);
+
+        VkDeviceSize slicePitch = blockCount.height * rowPitch;
+
+        if (image->info().type == VK_IMAGE_TYPE_3D && bufferSliceAlignment > elementSize)
+          slicePitch = bufferSliceAlignment >= slicePitch ? bufferSliceAlignment : align(slicePitch, bufferSliceAlignment);
+
+        copyRegion.bufferOffset      = aspectOffset;
+        copyRegion.bufferRowLength   = formatInfo->blockSize.width * rowPitch / elementSize;
+        copyRegion.bufferImageHeight = formatInfo->blockSize.height * slicePitch / rowPitch;
+
+        // Perform the actual copy
+        if constexpr (ToImage) {
+          m_cmd->cmdCopyBufferToImage(cmd, bufferSlice.handle,
+            image->handle(), imageLayout, 1, &copyRegion);
+        } else {
+          m_cmd->cmdCopyImageToBuffer(cmd, image->handle(), imageLayout,
+            bufferSlice.handle, 1, &copyRegion);
+        }
+
+        aspectOffset += blockCount.depth * slicePitch;
+      }
+
+      // Advance to next layer. This is non-trivial for multi-plane formats
+      // since plane data for each layer is expected to be packed.
+      VkDeviceSize layerPitch = aspectOffset - bufferOffset;
+
+      if (bufferSliceAlignment)
+        layerPitch = bufferSliceAlignment >= layerPitch ? bufferSliceAlignment : align(layerPitch, bufferSliceAlignment);
+
+      bufferOffset += layerPitch;
+    }
+  }
+
+
+  void DxvkContext::copyImageHostData(
+          DxvkCmdBuffer         cmd,
+    const Rc<DxvkImage>&        image,
+    const VkImageSubresourceLayers& imageSubresource,
+          VkOffset3D            imageOffset,
+          VkExtent3D            imageExtent,
+    const void*                 hostData,
+          VkDeviceSize          rowPitch,
+          VkDeviceSize          slicePitch) {
+    auto formatInfo = image->formatInfo();
+    auto srcData = reinterpret_cast<const char*>(hostData);
+
+    for (uint32_t i = 0; i < imageSubresource.layerCount; i++) {
+      auto layerData = srcData + i * slicePitch;
+
+      for (auto aspects = imageSubresource.aspectMask; aspects; ) {
+        auto aspect = vk::getNextAspect(aspects);
+        auto extent = imageExtent;
+
+        VkDeviceSize elementSize = formatInfo->elementSize;
+
+        if (formatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+          auto plane = &formatInfo->planes[vk::getPlaneIndex(aspect)];
+          extent.width  /= plane->blockSize.width;
+          extent.height /= plane->blockSize.height;
+          elementSize = plane->elementSize;
+        }
+
+        auto blockCount = util::computeBlockCount(extent, formatInfo->blockSize);
+        auto stagingSlice  = m_staging.alloc(CACHE_LINE_SIZE, elementSize * util::flattenImageExtent(blockCount));
+        auto stagingHandle = stagingSlice.getSliceHandle();
+
+        util::packImageData(stagingHandle.mapPtr, layerData,
+          blockCount, elementSize, rowPitch, slicePitch);
+
+        auto subresource = imageSubresource;
+        subresource.aspectMask = aspect;
+
+        this->copyImageBufferData<true>(cmd,
+          image, subresource, imageOffset, imageExtent,
+          image->pickLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+          stagingHandle, 0, 0);
+
+        layerData += blockCount.height * rowPitch;
+
+        m_cmd->trackResource<DxvkAccess::Read>(stagingSlice.buffer());
+      }
+    }
+  }
+
+
   void DxvkContext::clearImageViewFb(
     const Rc<DxvkImageView>&    imageView,
           VkOffset3D            offset,
@@ -2939,7 +3213,9 @@ namespace dxvk {
           VkExtent3D            extent) {
     auto dstSubresourceRange = vk::makeSubresourceRange(dstSubresource);
     auto srcSubresourceRange = vk::makeSubresourceRange(srcSubresource);
-    
+
+    auto dstFormatInfo = dstImage->formatInfo();
+
     if (m_execBarriers.isImageDirty(dstImage, dstSubresourceRange, DxvkAccess::Write)
      || m_execBarriers.isImageDirty(srcImage, srcSubresourceRange, DxvkAccess::Write))
       m_execBarriers.recordCommands(m_cmd);
@@ -2974,17 +3250,33 @@ namespace dxvk {
 
     m_execAcquires.recordCommands(m_cmd);
     
-    VkImageCopy imageRegion;
-    imageRegion.srcSubresource = srcSubresource;
-    imageRegion.srcOffset      = srcOffset;
-    imageRegion.dstSubresource = dstSubresource;
-    imageRegion.dstOffset      = dstOffset;
-    imageRegion.extent         = extent;
-    
-    m_cmd->cmdCopyImage(DxvkCmdBuffer::ExecBuffer,
-      srcImage->handle(), srcImageLayout,
-      dstImage->handle(), dstImageLayout,
-      1, &imageRegion);
+    for (auto aspects = dstSubresource.aspectMask; aspects; ) {
+      auto aspect = vk::getNextAspect(aspects);
+
+      VkImageCopy imageRegion;
+      imageRegion.srcSubresource = srcSubresource;
+      imageRegion.srcSubresource.aspectMask = aspect;
+      imageRegion.srcOffset      = srcOffset;
+      imageRegion.dstSubresource = dstSubresource;
+      imageRegion.dstSubresource.aspectMask = aspect;
+      imageRegion.dstOffset      = dstOffset;
+      imageRegion.extent         = extent;
+
+      if (dstFormatInfo->flags.test(DxvkFormatFlag::MultiPlane)) {
+        auto plane = &dstFormatInfo->planes[vk::getPlaneIndex(aspect)];
+        imageRegion.srcOffset.x /= plane->blockSize.width;
+        imageRegion.srcOffset.y /= plane->blockSize.height;
+        imageRegion.dstOffset.x /= plane->blockSize.width;
+        imageRegion.dstOffset.y /= plane->blockSize.height;
+        imageRegion.extent.width  /= plane->blockSize.width;
+        imageRegion.extent.height /= plane->blockSize.height;
+      }
+
+      m_cmd->cmdCopyImage(DxvkCmdBuffer::ExecBuffer,
+        srcImage->handle(), srcImageLayout,
+        dstImage->handle(), dstImageLayout,
+        1, &imageRegion);
+    }
     
     m_execBarriers.accessImage(
       dstImage, dstSubresourceRange,
