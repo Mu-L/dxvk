@@ -50,13 +50,15 @@ namespace dxvk {
     GpDynamicMultisampleState,  ///< Multisample state is dynamic
     GpDynamicRasterizerState,   ///< Cull mode and front face are dynamic
     GpDynamicVertexStrides,     ///< Vertex buffer strides are dynamic
+    GpHasPushData,              ///< Graphics pipeline uses push data
     GpIndependentSets,          ///< Graphics pipeline layout was created with independent sets
 
     CpDirtyPipelineState,       ///< Compute pipeline is out of date
     CpDirtySpecConstants,       ///< Compute spec constants are out of date
+    CpHasPushData,              ///< Compute pipeline uses push data
 
     DirtyDrawBuffer,            ///< Indirect argument buffer is dirty
-    DirtyPushConstants,         ///< Push constant data has changed
+    DirtyPushData,              ///< Push data needs to be updated
 
     ForceWriteAfterWriteSync,   ///< Ignores barrier control flags for write-after-write hazards
 
@@ -76,6 +78,7 @@ namespace dxvk {
     VariableMultisampleRate,
     DebugUtils,
     DirectMultiDraw,
+    DescriptorBuffer,
     FeatureCount
   };
 
@@ -137,8 +140,9 @@ namespace dxvk {
   };
 
 
-  struct DxvkPushConstantState {
-    char data[MaxPushConstantSize];
+  struct DxvkPushDataState {
+    std::array<char, MaxTotalPushDataSize> constantData = { };
+    std::array<char, MaxTotalPushDataSize> resourceData = { };
   };
 
 
@@ -210,12 +214,23 @@ namespace dxvk {
     DxvkVertexInputState      vi;
     DxvkViewportState         vp;
     DxvkOutputMergerState     om;
-    DxvkPushConstantState     pc;
+    DxvkPushDataState         pc;
     DxvkXfbState              xfb;
     DxvkDynamicState          dyn;
     
     DxvkGraphicsPipelineState gp;
     DxvkComputePipelineState  cp;
+  };
+
+
+  /**
+   * \brief View pair
+   *
+   * Stores a buffer view and an image view.
+   */
+  struct DxvkViewPair {
+    Rc<DxvkBufferView> bufferView;
+    Rc<DxvkImageView> imageView;
   };
   
 }
